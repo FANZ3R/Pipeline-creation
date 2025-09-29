@@ -1,0 +1,9 @@
+neo4j:
+  enabled: true
+  uri: "bolt://localhost:7688"
+  username: "neo4j"
+  password: "password"
+  clear_database: true
+  confidence_threshold: 0.5
+  entity_batch_size: 2000
+  relationship_batch_size: 1000
