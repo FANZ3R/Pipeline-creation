@@ -8,8 +8,6 @@ import yaml
 import logging
 from datetime import datetime
 import spacy
-import pandas as pd
-import json
 
 from pipeline.data_loader import DataLoader
 from pipeline.kg_extractor import GeneralizedKnowledgeGraphExtractor
@@ -40,11 +38,11 @@ def load_config():
         'batch_size': 50,
         'neo4j': {
             'enabled': False,
-            'uri': 'bolt://localhost:7688',  # Your custom port
+            'uri': 'bolt://localhost:7688',
             'username': 'neo4j',
             'password': 'password123',
             'clear_database': True,
-            'use_confidence_filter': False,  # Import ALL relationships
+            'use_confidence_filter': False,
             'entity_batch_size': 2000,
             'relationship_batch_size': 1000
         }
@@ -65,76 +63,6 @@ def load_config():
         print("Created config.yaml - you can customize settings there")
     
     return config
-
-
-def save_enhanced_results(entities, relationships, output_dir):
-    """Save results with proper CSV structure for Neo4j import"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save entities to JSON
-    entities_json = f"{output_dir}/entities_{timestamp}.json"
-    with open(entities_json, 'w', encoding='utf-8') as f:
-        json.dump(entities, f, indent=2, ensure_ascii=False)
-    
-    # Save relationships to JSON  
-    relationships_json = f"{output_dir}/relationships_{timestamp}.json"
-    with open(relationships_json, 'w', encoding='utf-8') as f:
-        json.dump(relationships, f, indent=2, ensure_ascii=False)
-    
-    # Save entities to CSV
-    entities_df = pd.DataFrame(entities)
-    entities_csv = f"{output_dir}/entities_{timestamp}.csv"
-    entities_df.to_csv(entities_csv, index=False, encoding='utf-8')
-    
-    # Create PROPER relationships CSV with correct column mapping
-    relationships_simple = []
-    for rel in relationships:
-        # Extract subject and object info properly
-        subject_info = rel.get('subject', {})
-        object_info = rel.get('object', {})
-        
-        # Handle both dict and string formats
-        if isinstance(subject_info, dict):
-            subject_text = subject_info.get('text', '')
-            subject_id = subject_info.get('id', '')
-        else:
-            subject_text = str(subject_info)
-            subject_id = ''
-            
-        if isinstance(object_info, dict):
-            object_text = object_info.get('text', '')
-            object_id = object_info.get('id', '')
-        else:
-            object_text = str(object_info)
-            object_id = ''
-        
-        relationships_simple.append({
-            'subject': subject_text,  # Text for matching
-            'subject_id': subject_id,  # ID for reference
-            'relation': rel.get('discovered_type', 'RELATED'),
-            'object': object_text,  # Text for matching
-            'object_id': object_id,  # ID for reference
-            'confidence': rel.get('confidence', 0.5),
-            'sources': ', '.join(rel.get('sources', [])) if isinstance(rel.get('sources'), list) else str(rel.get('source', '')),
-            'block_id': rel.get('block_id', -1)
-        })
-    
-    relationships_df = pd.DataFrame(relationships_simple)
-    relationships_csv = f"{output_dir}/relationships_{timestamp}.csv"
-    relationships_df.to_csv(relationships_csv, index=False, encoding='utf-8')
-    
-    print(f"\n✅ Files saved:")
-    print(f"  - {entities_json} ({os.path.getsize(entities_json)/1e6:.1f} MB)")
-    print(f"  - {relationships_json} ({os.path.getsize(relationships_json)/1e6:.1f} MB)")
-    print(f"  - {entities_csv} ({os.path.getsize(entities_csv)/1e6:.1f} MB)")
-    print(f"  - {relationships_csv} ({os.path.getsize(relationships_csv)/1e6:.1f} MB)")
-    
-    return {
-        'entities_json': entities_json,
-        'relationships_json': relationships_json,
-        'entities_csv': entities_csv,
-        'relationships_csv': relationships_csv
-    }
 
 
 def main():
@@ -158,6 +86,7 @@ def main():
         logger.info("Initializing components...")
         
         data_loader = DataLoader()
+        output_saver = OutputSaver(config['output_directory'])  # Use OutputSaver
         
         # Load spaCy model
         try:
@@ -211,8 +140,7 @@ def main():
                         entity['block_id'] = block['block_id']
                         all_entities.append(entity)
                     
-                    # CRITICAL: Relationships already have full entity objects
-                    # from the extraction, just add source info
+                    # Relationships already have full entity objects
                     for relationship in kg_result['relationships']:
                         relationship['source_file'] = block['source']
                         relationship['block_id'] = block['block_id']
@@ -222,10 +150,15 @@ def main():
                     logger.error(f"Failed to process block {block['block_id']}: {e}")
                     continue
         
-        # 4. Save results with proper CSV structure
+        # 4. Save results using OutputSaver (which now has the correct structure)
         logger.info("Saving results...")
         
-        files_saved = save_enhanced_results(all_entities, all_relationships, config['output_directory'])
+        files_saved = output_saver.save_results(all_entities, all_relationships)
+        
+        # Optionally save to Neo4j if enabled
+        if config['neo4j']['enabled']:
+            logger.info("Exporting to Neo4j...")
+            output_saver.save_to_neo4j(all_entities, all_relationships, config['neo4j'])
         
         # 5. Summary
         end_time = datetime.now()
@@ -264,7 +197,7 @@ def main():
         if not config['neo4j']['enabled']:
             print("\n💡 Tip: To export to Neo4j, run: python fast_export.py")
         else:
-            print("\n✅ Neo4j export enabled - data will be imported automatically")
+            print("\n✅ Neo4j export completed")
         
         logger.info("Pipeline completed successfully")
         

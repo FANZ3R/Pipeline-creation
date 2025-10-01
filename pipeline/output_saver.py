@@ -1,5 +1,5 @@
 """
-Simple output saver - saves results to JSON and CSV
+Simple output saver - saves results to JSON and CSV with proper structure for Neo4j
 """
 
 import json
@@ -16,7 +16,7 @@ class OutputSaver:
         os.makedirs(output_dir, exist_ok=True)
     
     def save_results(self, entities, relationships):
-        """Save entities and relationships"""
+        """Save entities and relationships with proper structure"""
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -36,16 +36,40 @@ class OutputSaver:
             entities_csv = f"{self.output_dir}/entities_{timestamp}.csv"
             entities_df.to_csv(entities_csv, index=False)
         
-        # Save relationships CSV (simplified)
+        # Save relationships CSV with PROPER structure for Neo4j matching
         if relationships:
             simple_rels = []
             for rel in relationships:
+                # Extract subject and object properly
+                subject_info = rel.get('subject', {})
+                object_info = rel.get('object', {})
+                
+                # Handle both dict and string formats
+                if isinstance(subject_info, dict):
+                    subject_text = subject_info.get('text', '')
+                    subject_id = subject_info.get('id', '')
+                else:
+                    subject_text = str(subject_info)
+                    subject_id = ''
+                
+                if isinstance(object_info, dict):
+                    object_text = object_info.get('text', '')
+                    object_id = object_info.get('id', '')
+                else:
+                    object_text = str(object_info)
+                    object_id = ''
+                
+                # Create row with all necessary fields
                 simple_rels.append({
-                    'subject': rel.get('subject', {}).get('text', ''),
-                    'relation': rel.get('discovered_type', ''),
-                    'object': rel.get('object', {}).get('text', ''),
-                    'confidence': rel.get('confidence', 0),
-                    'sources': ', '.join(rel.get('sources', []))
+                    'id': rel.get('id', ''),
+                    'subject_text': subject_text,  # For Neo4j text matching
+                    'subject_id': subject_id,      # Keep for reference
+                    'discovered_type': rel.get('discovered_type', 'RELATED'),
+                    'object_text': object_text,    # For Neo4j text matching  
+                    'object_id': object_id,        # Keep for reference
+                    'confidence': rel.get('confidence', 0.5),
+                    'source': ', '.join(rel.get('sources', [])) if isinstance(rel.get('sources'), list) else str(rel.get('source', '')),
+                    'block_id': rel.get('block_id', -1)
                 })
             
             relations_df = pd.DataFrame(simple_rels)
@@ -87,7 +111,7 @@ class OutputSaver:
         }
     
     def save_to_neo4j(self, entities, relationships, neo4j_config):
-        """Optional Neo4j export"""
+        """Optional Neo4j export - now with text-based matching"""
         try:
             from neo4j import GraphDatabase
             
@@ -101,15 +125,16 @@ class OutputSaver:
                 if neo4j_config.get('clear_database', False):
                     session.run("MATCH (n) DETACH DELETE n")
                 
+                # Create index for text matching
+                session.run("CREATE INDEX entity_text IF NOT EXISTS FOR (e:Entity) ON (e.text)")
+                
                 # Add entities
                 for entity in entities:
                     session.run("""
-                        CREATE (e:Entity {
-                            id: $id,
-                            text: $text,
-                            label: $label,
-                            confidence: $confidence
-                        })
+                        MERGE (e:Entity {text: $text})
+                        SET e.id = $id,
+                            e.label = $label,
+                            e.confidence = $confidence
                     """, 
                     id=entity['id'],
                     text=entity['text'],
@@ -117,23 +142,34 @@ class OutputSaver:
                     confidence=entity.get('confidence', 0)
                     )
                 
-                # Add relationships
+                # Add relationships - matching by TEXT not ID
                 for rel in relationships:
-                    subject_id = rel.get('subject', {}).get('id')
-                    object_id = rel.get('object', {}).get('id')
+                    subject_info = rel.get('subject', {})
+                    object_info = rel.get('object', {})
                     
-                    if subject_id and object_id:
+                    # Get text for matching
+                    if isinstance(subject_info, dict):
+                        subject_text = subject_info.get('text', '')
+                    else:
+                        subject_text = str(subject_info)
+                    
+                    if isinstance(object_info, dict):
+                        object_text = object_info.get('text', '')
+                    else:
+                        object_text = str(object_info)
+                    
+                    if subject_text and object_text:
                         session.run("""
-                            MATCH (s:Entity {id: $subject_id})
-                            MATCH (o:Entity {id: $object_id})
+                            MATCH (s:Entity {text: $subject_text})
+                            MATCH (o:Entity {text: $object_text})
                             CREATE (s)-[r:RELATED {
                                 type: $rel_type,
                                 confidence: $confidence
                             }]->(o)
                         """,
-                        subject_id=subject_id,
-                        object_id=object_id,
-                        rel_type=rel.get('discovered_type', ''),
+                        subject_text=subject_text,
+                        object_text=object_text,
+                        rel_type=rel.get('discovered_type', 'RELATED'),
                         confidence=rel.get('confidence', 0)
                         )
             

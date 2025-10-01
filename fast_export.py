@@ -95,20 +95,40 @@ class CSVNeo4jExporter:
             return False
     
     def clear_and_setup(self, force_clear=True):
-        """Fast database clear and constraint setup"""
-        with self.driver.session() as session:
-            if force_clear:
-                print("Clearing existing data...")
-                session.run("MATCH (n) DETACH DELETE n")
-                print("Database cleared")
-            
-            # Create constraint
-            try:
-                session.run("DROP CONSTRAINT entity_id IF EXISTS")
-                session.run("CREATE CONSTRAINT entity_id FOR (e:Entity) REQUIRE e.id IS UNIQUE")
+        """Fast database clear and constraint setup with batched operations"""
+        try:
+            with self.driver.session() as session:
+                if force_clear:
+                    print("Clearing existing data...")
+                    # Clear in smaller batches to avoid memory issues
+                    while True:
+                        result = session.run("""
+                            MATCH (n) 
+                            WITH n LIMIT 10000
+                            DETACH DELETE n
+                            RETURN count(n) as deleted
+                        """)
+                        deleted = result.single()['deleted']
+                        if deleted == 0:
+                            break
+                        print(f"  Deleted {deleted} nodes...")
+                    print("Database cleared")
+                
+                # Create constraint with smaller transaction
+                try:
+                    session.run("DROP CONSTRAINT entity_id IF EXISTS")
+                except:
+                    pass
+                    
+                session.run("CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE")
                 print("Created entity ID constraint")
-            except Exception as e:
-                print(f"Constraint handling: {e}")
+                
+                # Create text index for matching
+                session.run("CREATE INDEX entity_text IF NOT EXISTS FOR (e:Entity) ON (e.text)")
+                print("Created entity text index")
+                
+        except Exception as e:
+            print(f"Setup warning: {e}")
     
     def get_csv_info(self, csv_file):
         """Get information about a CSV file without loading it"""
@@ -137,24 +157,24 @@ class CSVNeo4jExporter:
         
         total_imported = 0
         
-        with self.driver.session() as session:
-            # Use pandas chunking for memory efficiency
-            chunks = pd.read_csv(csv_file, chunksize=batch_size)
-            
-            with tqdm(total=info['rows'], desc="Importing entities") as pbar:
-                for chunk_df in chunks:
-                    # Fill NaN values with defaults
-                    chunk_df = chunk_df.fillna({
-                        'confidence': 0.0,
-                        'source': 'unknown',
-                        'block_id': -1,
-                        'text': '',
-                        'label': 'UNKNOWN'
-                    })
-                    
-                    batch = chunk_df.to_dict('records')
-                    
-                    # Use MERGE for safety with duplicates
+        # Use pandas chunking for memory efficiency
+        chunks = pd.read_csv(csv_file, chunksize=batch_size)
+        
+        with tqdm(total=info['rows'], desc="Importing entities") as pbar:
+            for chunk_df in chunks:
+                # Fill NaN values with defaults
+                chunk_df = chunk_df.fillna({
+                    'confidence': 0.0,
+                    'source': 'unknown',
+                    'block_id': -1,
+                    'text': '',
+                    'label': 'UNKNOWN'
+                })
+                
+                batch = chunk_df.to_dict('records')
+                
+                # Use smaller transactions
+                with self.driver.session() as session:
                     session.run("""
                         UNWIND $batch as entity
                         MERGE (e:Entity {id: entity.id})
@@ -162,103 +182,107 @@ class CSVNeo4jExporter:
                             e.label = coalesce(entity.label, 'UNKNOWN'),
                             e.confidence = toFloat(coalesce(entity.confidence, 0)),
                             e.source = coalesce(entity.source, 'unknown'),
-                            e.block_id = toInteger(coalesce(entity.block_id, -1))
+                            e.block_id = coalesce(entity.block_id, -1)
                     """, batch=batch)
-                    
-                    total_imported += len(batch)
-                    pbar.update(len(batch))
+                
+                total_imported += len(batch)
+                pbar.update(len(batch))
         
         print(f"✓ Imported {total_imported:,} entities")
         return total_imported
     
-    def build_entity_text_index(self):
-        """Build an index to lookup entities by text for relationship matching"""
-        print("Building entity text index for relationship matching...")
-        with self.driver.session() as session:
-            result = session.run("""
-                CREATE INDEX entity_text IF NOT EXISTS FOR (e:Entity) ON (e.text)
-            """)
-        print("Entity text index created")
-    
     def bulk_import_relationships_csv(self, csv_file, batch_size=1000, min_confidence=None):
-        """Import ALL relationships from CSV - matching entities by TEXT not ID"""
+        """Import relationships from CSV - matching entities by TEXT"""
         print(f"\nImporting relationships from CSV: {csv_file.name}")
-        print("NOTE: Matching entities by TEXT field, not ID")
-        
-        # First, create text index for faster matching
-        print("Creating text index for entity matching...")
-        with self.driver.session() as session:
-            session.run("CREATE INDEX entity_text IF NOT EXISTS FOR (e:Entity) ON (e.text)")
+        print("NOTE: Matching entities by TEXT field")
         
         # Get file info
         info = self.get_csv_info(csv_file)
         print(f"  Rows: {info['rows']:,}")
-        print(f"  Columns: {', '.join(info['columns'][:5])}...")
+        print(f"  Columns: {', '.join(info['columns'])}")
         print(f"  Size: {info['size_mb']:.1f} MB")
+        
+        # Read first few rows to understand structure
+        sample_df = pd.read_csv(csv_file, nrows=5)
+        print(f"\nDetected columns: {sample_df.columns.tolist()}")
         
         total_processed = 0
         total_imported = 0
         failed_count = 0
         skipped_count = 0
         
-        with self.driver.session() as session:
-            # Use pandas chunking
-            chunks = pd.read_csv(csv_file, chunksize=batch_size)
-            
-            with tqdm(total=info['rows'], desc="Importing relationships (text matching)") as pbar:
-                for chunk_df in chunks:
-                    total_processed += len(chunk_df)
+        # Use pandas chunking
+        chunks = pd.read_csv(csv_file, chunksize=batch_size)
+        
+        with tqdm(total=info['rows'], desc="Importing relationships") as pbar:
+            for chunk_df in chunks:
+                total_processed += len(chunk_df)
+                
+                # Identify columns
+                subject_col = None
+                object_col = None
+                
+                if 'subject_text' in chunk_df.columns and 'object_text' in chunk_df.columns:
+                    subject_col = 'subject_text'
+                    object_col = 'object_text'
+                elif 'subject' in chunk_df.columns and 'object' in chunk_df.columns:
+                    subject_col = 'subject'
+                    object_col = 'object'
+                
+                if not subject_col or not object_col:
+                    print(f"Warning: Could not find text columns")
+                    pbar.update(len(chunk_df))
+                    continue
+                
+                # Skip rows with NaN
+                original_len = len(chunk_df)
+                chunk_df = chunk_df.dropna(subset=[subject_col, object_col])
+                skipped_count += (original_len - len(chunk_df))
+                
+                if len(chunk_df) == 0:
+                    pbar.update(original_len)
+                    continue
+                
+                # Apply confidence filter if specified
+                if min_confidence is not None and 'confidence' in chunk_df.columns:
+                    chunk_df = chunk_df[chunk_df['confidence'] >= min_confidence]
+                
+                # Fill NaN values
+                chunk_df = chunk_df.fillna({
+                    'confidence': 0.5,
+                    'source': '',
+                    'sources': '',
+                    'discovered_type': 'RELATED',
+                    'block_id': -1
+                })
+                
+                batch = chunk_df.to_dict('records')
+                
+                # Process batch
+                for rel in batch:
+                    rel['subject_text'] = str(rel[subject_col]).strip()
+                    rel['object_text'] = str(rel[object_col]).strip()
                     
-                    # Skip rows where subject or object is NaN
-                    if 'subject' in chunk_df.columns and 'object' in chunk_df.columns:
-                        original_len = len(chunk_df)
-                        chunk_df = chunk_df.dropna(subset=['subject', 'object'])
-                        skipped_count += (original_len - len(chunk_df))
+                    rel_type = (rel.get('discovered_type') or 
+                               rel.get('relation') or 
+                               'RELATED')
+                    rel['relationship_type'] = str(rel_type).upper().replace(' ', '_').replace('-', '_')[:50]  # Limit length
                     
-                    if len(chunk_df) == 0:
-                        pbar.update(batch_size)
-                        continue
-                    
-                    # Fill NaN values for other fields
-                    chunk_df = chunk_df.fillna({
-                        'confidence': 0.0,
-                        'source': '',
-                        'sources': '',
-                        'relation': 'RELATED',
-                        'discovered_type': 'RELATED',
-                        'block_id': -1
-                    })
-                    
-                    batch = chunk_df.to_dict('records')
-                    
-                    # Process relationship types
-                    for rel in batch:
-                        # Use subject/object TEXT directly for matching
-                        rel['subject_text'] = str(rel.get('subject', '')).strip()
-                        rel['object_text'] = str(rel.get('object', '')).strip()
-                        
-                        # Handle relationship type
-                        rel_type = (rel.get('relation') or 
-                                   rel.get('discovered_type') or 
-                                   rel.get('relationship_type') or 
-                                   'RELATED')
-                        rel['relationship_type'] = str(rel_type).upper().replace(' ', '_').replace('-', '_')
-                        
-                        # Handle source/sources
-                        if not rel.get('source') and rel.get('sources'):
-                            rel['source'] = rel['sources']
-                    
-                    try:
-                        # Match entities by TEXT field, not ID
+                    if 'source' not in rel or not rel['source']:
+                        if 'sources' in rel:
+                            rel['source'] = str(rel['sources'])
+                
+                try:
+                    with self.driver.session() as session:
                         result = session.run("""
                             UNWIND $batch as rel
                             MATCH (s:Entity {text: rel.subject_text})
                             MATCH (o:Entity {text: rel.object_text})
                             CREATE (s)-[r:RELATED {
                                 type: rel.relationship_type,
-                                confidence: toFloat(coalesce(rel.confidence, 0)),
+                                confidence: toFloat(coalesce(rel.confidence, 0.5)),
                                 source: coalesce(rel.source, ''),
-                                block_id: toInteger(coalesce(rel.block_id, -1))
+                                block_id: coInteger(coalesce(rel.block_id, -1))
                             }]->(o)
                             RETURN count(r) as created_count
                         """, batch=batch)
@@ -269,20 +293,19 @@ class CSVNeo4jExporter:
                         if created < len(batch):
                             failed_count += (len(batch) - created)
                             
-                    except Exception as e:
-                        failed_count += len(batch)
-                        if failed_count <= 5:  # Show first few errors
-                            self.logger.warning(f"Failed batch: {e}")
-                    
-                    pbar.update(original_len if 'original_len' in locals() else len(chunk_df))
+                except Exception as e:
+                    failed_count += len(batch)
+                    if failed_count <= 5:
+                        self.logger.warning(f"Failed batch: {str(e)[:100]}")
+                
+                pbar.update(original_len)
         
-        print(f"✓ Processed {total_processed:,} relationships")
+        print(f"\n✓ Processed {total_processed:,} relationship rows")
         print(f"✓ Successfully imported {total_imported:,} relationships")
         if skipped_count > 0:
-            print(f"⚠ Skipped {skipped_count:,} rows (missing subject/object)")
+            print(f"⚠ Skipped {skipped_count:,} rows (missing data)")
         if failed_count > 0:
-            print(f"⚠ Failed: {failed_count:,} (entities with that TEXT not found)")
-            print("  Note: Entity text must match EXACTLY for relationships to connect")
+            print(f"⚠ Failed: {failed_count:,} (entities not found)")
         
         return total_processed, total_imported
     
@@ -338,11 +361,7 @@ def main():
     
     if not entity_csv or not rel_csv:
         print("\n❌ No CSV files found in data/output/")
-        if entity_json and rel_json:
-            print("   JSON files are available but this tool uses CSV for performance.")
-            print("   Please ensure CSV files are generated by the pipeline.")
-        else:
-            print("   Run the main pipeline first: python main.py")
+        print("   Run the main pipeline first: python main.py")
         return
     
     # Show selected files
@@ -370,9 +389,6 @@ def main():
         return
     
     neo4j_config = config.get('neo4j', {})
-    if not neo4j_config.get('enabled', False):
-        print("❌ Neo4j is disabled in config.yaml")
-        return
     
     print(f"\n🔗 Neo4j configuration:")
     print(f"   URI: {neo4j_config['uri']}")
@@ -402,7 +418,7 @@ def main():
         exporter.clear_and_setup(force_clear=clear_db)
         
         # Performance settings
-        use_filtering = neo4j_config.get('use_confidence_filter', False)  # Default: NO FILTERING
+        use_filtering = neo4j_config.get('use_confidence_filter', False)
         confidence_threshold = neo4j_config.get('confidence_threshold', 0.5) if use_filtering else None
         entity_batch_size = neo4j_config.get('entity_batch_size', 2000)
         rel_batch_size = neo4j_config.get('relationship_batch_size', 1000)
@@ -424,11 +440,11 @@ def main():
             batch_size=entity_batch_size
         )
         
-        # Import relationships from CSV - NO FILTERING by default
+        # Import relationships from CSV
         total_rels, imported_rels = exporter.bulk_import_relationships_csv(
             rel_csv, 
             batch_size=rel_batch_size,
-            min_confidence=confidence_threshold  # Will be None if filtering disabled
+            min_confidence=confidence_threshold
         )
         
         end_time = datetime.now()
@@ -449,7 +465,7 @@ def main():
         print(f"   Relationships processed: {total_rels:,}")
         print(f"   Relationships imported: {imported_rels:,}")
         if total_rels > 0:
-            print(f"   Filter efficiency: {(imported_rels/total_rels)*100:.1f}% passed confidence threshold")
+            print(f"   Success rate: {(imported_rels/total_rels)*100:.1f}%")
         
         print(f"\n🗄️  Database Status:")
         print(f"   Total nodes: {stats['total_nodes']:,}")
