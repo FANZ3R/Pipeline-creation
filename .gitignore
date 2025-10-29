@@ -16,10 +16,47 @@ logs/
 # Ignore data files
 data/input/
 data/output/
-
+cleaned_data/
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
 
 # Ignore system files
 .DS_Store
 Thumbs.db
+
+
+# Ignoring all the data files in the json and xlsx formats
+*.json
+*.xlsx
+
+
+#virtual environment
+kg_pipelined/
+
+#Output files
+kg_output/
+data/output/
+data/input/
+cleaned_data/
+
+
+#large source files
+Procurement
+EOF
+
+
+
+
+# Output directory - exclude large data files
+kg_output/*.csv
+kg_output/*.json
+kg_output/**/*.csv
+kg_output/**/*.json
+kg_output/**/*.xlsx
+
+
+# Virtual environment (if accidentally added)
+kg_pipelined/lib/
+kg_pipelined/bin/
+kg_pipelined/include/
+EOF
