@@ -10,6 +10,9 @@ __pycache__/
 env/
 venv/
 
+# Ignore environment variables file (contains passwords)
+.env
+
 # Ignore logs
 logs/
 
