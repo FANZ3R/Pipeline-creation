@@ -1,6 +1,6 @@
-# Minimal Knowledge Graph Pipeline Requirements
+# Knowledge Graph Extraction Pipeline Requirements
 
-# Core NLP
+# Core NLP and ML
 spacy>=3.7.0
 pandas>=2.0.0
 numpy>=1.24.0
@@ -8,15 +8,18 @@ numpy>=1.24.0
 # Configuration
 PyYAML>=6.0
 
-# Optional document processing
+# Document processing
 PyPDF2>=3.0.0
 python-docx>=1.1.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
 
-# Optional Neo4j support
+# Neo4j support
 neo4j>=5.0.0
 
-# Progress tracking
+# Progress tracking and utilities
 tqdm>=4.65.0
+python-dotenv>=1.0.0
 
-# Data handling
-collections-extended>=2.0.2
+# Note: To install spaCy language model, run:
+# python -m spacy download en_core_web_sm
